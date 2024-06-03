@@ -1,17 +1,14 @@
 import os
-import sys
 
 import torch
 import torch.amp
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import transforms
-from tqdm import tqdm
 
+import transforms
 from model import create_deep_pose_model
 from datasets import WFLWDataset
-from losses import WingLoss
-from metrics import NMEMetric
+from train_utils.train_eval_utils import train_one_epoch, evaluate
 
 
 def get_args_parser(add_help=True):
@@ -22,18 +19,16 @@ def get_args_parser(add_help=True):
     parser.add_argument("--device", type=str, default="cuda:0", help="training device, e.g. cpu, cuda:0")
     parser.add_argument("--save_weights_dir", type=str, default="./weights", help="save dir for model weights")
     parser.add_argument("--save_freq", type=int, default=5, help="save frequency for weights and generated imgs")
+    parser.add_argument("--eval_freq", type=int, default=5, help="evaluate frequency")
     parser.add_argument('--img_hw', default=[256, 256], nargs='+', type=int, help='training image size[h, w]')
-    parser.add_argument("--epochs", type=int, default=30, help="number of epochs of training")
+    parser.add_argument("--epochs", type=int, default=210, help="number of epochs of training")
     parser.add_argument("--batch_size", type=int, default=32, help="size of the batches")
     parser.add_argument("--num_workers", type=int, default=8, help="number of workers, default: 8")
     parser.add_argument("--num_keypoints", type=int, default=98, help="number of keypoints")
     parser.add_argument("--lr", type=float, default=5e-4, help="SGD: learning rate")
-    parser.add_argument('--lr_steps', default=[20, 25], nargs='+', type=int, help='decrease lr every step-size epochs')
-    parser.add_argument("--warmup_epoch", type=int, default=2, help="number of warmup epoch for training")
-    parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
-    parser.add_argument('--wd', '--weight_decay', default=1e-4, type=float,
-                        metavar='W', help='weight decay (default: 1e-4)',
-                        dest='weight_decay')
+    parser.add_argument('--lr_steps', default=[170, 200], nargs='+', type=int,
+                        help='decrease lr every step-size epochs')
+    parser.add_argument("--warmup_epoch", type=int, default=10, help="number of warmup epoch for training")
     parser.add_argument('--resume', default='', type=str, help='resume from checkpoint')
 
     return parser
@@ -44,6 +39,7 @@ def main(args):
     dataset_dir = args.dataset_dir
     save_weights_dir = args.save_weights_dir
     save_freq = args.save_freq
+    eval_freq = args.eval_freq
     num_keypoints = args.num_keypoints
     num_workers = args.num_workers
     epochs = args.epochs
@@ -91,20 +87,19 @@ def main(args):
                               shuffle=True,
                               pin_memory=True,
                               num_workers=num_workers,
-                              collate_fn=WFLWDataset.collate_fn)
+                              collate_fn=WFLWDataset.collate_fn,
+                              persistent_workers=True)
 
     val_loader = DataLoader(val_dataset,
                             batch_size=bs,
                             shuffle=False,
                             pin_memory=True,
                             num_workers=num_workers,
-                            collate_fn=WFLWDataset.collate_fn)
-
-    # define loss function
-    loss_func = WingLoss()
+                            collate_fn=WFLWDataset.collate_fn,
+                            persistent_workers=True)
 
     # define optimizers
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # define learning rate scheduler
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -121,7 +116,8 @@ def main(args):
 
     lr_scheduler = torch.optim.lr_scheduler.ChainedScheduler([warmup_scheduler, multi_step_scheduler])
 
-    if args.resume != "":
+    if args.resume:
+        assert os.path.exists(args.resume)
         checkpoint = torch.load(args.resume, map_location='cpu')
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -131,52 +127,27 @@ def main(args):
 
     for epoch in range(start_epoch, epochs):
         # train
-        model.train()
-        train_bar = tqdm(train_loader, file=sys.stdout)
-        for step, (imgs, targets) in enumerate(train_bar):
-            imgs = imgs.to(device)
-            labels = targets["keypoints"].to(device)
-
-            optimizer.zero_grad()
-            # use mixed precision to speed up training
-            with torch.autocast(device_type=device.type):
-                pred = model(imgs)
-                loss = loss_func(pred.reshape((-1, num_keypoints, 2)), labels)
-
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-
-            train_bar.desc = "train epoch[{}/{}] loss:{:.3f}".format(epoch + 1,
-                                                                     epochs,
-                                                                     loss)
-
-            global_step = epoch * len(train_loader) + step
-            tb_writer.add_scalar("train loss", loss.item(), global_step=global_step)
-            tb_writer.add_scalar("learning rate", optimizer.param_groups[0]["lr"], global_step=global_step)
+        train_one_epoch(model=model,
+                        epoch=epoch,
+                        train_loader=train_loader,
+                        device=device,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        tb_writer=tb_writer,
+                        num_keypoints=num_keypoints)
 
         # eval
-        model.eval()
-        with torch.inference_mode():
-            metric = NMEMetric()
-            eval_bar = tqdm(val_loader, file=sys.stdout, desc="evaluation")
-            for step, (imgs, targets) in enumerate(eval_bar):
-                imgs = imgs.to(device)
-                m_invs = targets["m_invs"].to(device)
-                labels = targets["ori_keypoints"].to(device)
+        if epoch % eval_freq == 0 or epoch == args.epochs - 1:
+            evaluate(model=model,
+                     epoch=epoch,
+                     val_loader=val_loader,
+                     device=device,
+                     tb_writer=tb_writer,
+                     affine_points_torch_func=transforms.affine_points_torch,
+                     num_keypoints=num_keypoints,
+                     img_hw=img_hw)
 
-                pred = model(imgs)
-                pred = pred.reshape((-1, num_keypoints, 2))  # [N, K, 2]
-                wh_tensor = torch.as_tensor(img_hw[::-1], dtype=pred.dtype, device=pred.device).reshape([1, 1, 2])
-                pred = pred * wh_tensor  # rel coord to abs coord
-                pred = transforms.affine_points_torch(pred, m_invs)
-
-                metric.update(pred, labels)
-
-            nme = metric.evaluate()
-            tb_writer.add_scalar("evaluation nme", nme, global_step=epoch)
-            print(f"evaluation NME: {nme:.3f}")
-
+        # save weights
         if epoch % save_freq == 0 or epoch == args.epochs - 1:
             save_files = {
                 'model': model.state_dict(),
