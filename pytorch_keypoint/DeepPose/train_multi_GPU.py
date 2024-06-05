@@ -2,13 +2,14 @@ import os
 
 import torch
 import torch.amp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler, BatchSampler
 from torch.utils.tensorboard import SummaryWriter
 
 import transforms
 from model import create_deep_pose_model
 from datasets import WFLWDataset
 from train_utils.train_eval_utils import train_one_epoch, evaluate
+from train_utils.distributed_utils import init_distributed_mode, is_main_process
 
 
 def get_args_parser(add_help=True):
@@ -30,12 +31,17 @@ def get_args_parser(add_help=True):
                         help='decrease lr every step-size epochs')
     parser.add_argument("--warmup_epoch", type=int, default=10, help="number of warmup epoch for training")
     parser.add_argument('--resume', default='', type=str, help='resume from checkpoint')
+    parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
 
     return parser
 
 
 def main(args):
     torch.manual_seed(1234)
+    init_distributed_mode(args)
+    assert args.distributed
+    print(args)
+
     dataset_dir = args.dataset_dir
     save_weights_dir = args.save_weights_dir
     save_freq = args.save_freq
@@ -54,12 +60,15 @@ def main(args):
         device = torch.device(args.device)
     print(f"using device: {device} for training.")
 
-    # tensorboard writer
-    tb_writer = SummaryWriter()
+    tb_writer = None
+    if is_main_process():
+        # tensorboard writer
+        tb_writer = SummaryWriter()
 
     # create model
     model = create_deep_pose_model(num_keypoints)
     model.to(device)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
 
     # config dataset and dataloader
     data_transform = {
@@ -82,9 +91,12 @@ def main(args):
                               train=False,
                               transforms=data_transform["val"])
 
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset)
+    train_batch_sampler = BatchSampler(train_sampler, args.batch_size, drop_last=True)
+
     train_loader = DataLoader(train_dataset,
-                              batch_size=bs,
-                              shuffle=True,
+                              batch_sampler=train_batch_sampler,
                               pin_memory=True,
                               num_workers=num_workers,
                               collate_fn=WFLWDataset.collate_fn,
@@ -92,6 +104,7 @@ def main(args):
 
     val_loader = DataLoader(val_dataset,
                             batch_size=bs,
+                            sampler=val_sampler,
                             shuffle=False,
                             pin_memory=True,
                             num_workers=num_workers,
@@ -119,7 +132,7 @@ def main(args):
     if args.resume:
         assert os.path.exists(args.resume)
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
+        model.module.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         start_epoch = checkpoint['epoch'] + 1
@@ -148,9 +161,9 @@ def main(args):
                      img_hw=img_hw)
 
         # save weights
-        if epoch % save_freq == 0 or epoch == args.epochs - 1:
+        if is_main_process() and (epoch % save_freq == 0 or epoch == args.epochs - 1):
             save_files = {
-                'model': model.state_dict(),
+                'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'epoch': epoch

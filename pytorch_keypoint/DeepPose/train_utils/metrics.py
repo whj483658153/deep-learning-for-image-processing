@@ -1,12 +1,15 @@
 import torch
 
+from .distributed_utils import reduce_value, is_dist_avail_and_initialized
+
 
 class NMEMetric:
-    def __init__(self) -> None:
+    def __init__(self, device: torch.device) -> None:
         # 两眼外角点对应keypoint索引
         self.keypoint_idxs = [60, 72]
-        self.nme_accumulator = 0.
-        self.counter = 0.
+        self.nme_accumulator: float = 0.
+        self.counter: float = 0.
+        self.device = device
 
     def update(self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor = None):
         """
@@ -35,6 +38,18 @@ class NMEMetric:
 
     def evaluate(self):
         return self.nme_accumulator / self.counter
+
+    def synchronize_results(self):
+        if is_dist_avail_and_initialized():
+            self.nme_accumulator = reduce_value(
+                torch.as_tensor(self.nme_accumulator, device=self.device),
+                average=False
+            ).item()
+
+            self.counter = reduce_value(
+                torch.as_tensor(self.counter, device=self.device),
+                average=False
+            )
 
 
 if __name__ == '__main__':

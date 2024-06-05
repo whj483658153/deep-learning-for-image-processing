@@ -1,4 +1,5 @@
 import sys
+import math
 from typing import Callable, List
 
 from tqdm import tqdm
@@ -8,6 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .losses import WingLoss
 from .metrics import NMEMetric
+from .distributed_utils import is_main_process, reduce_value
 
 
 def train_one_epoch(model: torch.nn.Module,
@@ -22,7 +24,10 @@ def train_one_epoch(model: torch.nn.Module,
     loss_func = WingLoss()
 
     model.train()
-    train_bar = tqdm(train_loader, file=sys.stdout)
+    train_bar = train_loader
+    if is_main_process():
+        train_bar = tqdm(train_loader, file=sys.stdout)
+
     for step, (imgs, targets) in enumerate(train_bar):
         imgs = imgs.to(device)
         labels = targets["keypoints"].to(device)
@@ -33,15 +38,21 @@ def train_one_epoch(model: torch.nn.Module,
             pred: torch.Tensor = model(imgs)
             loss: torch.Tensor = loss_func(pred.reshape((-1, num_keypoints, 2)), labels)
 
+        loss_value = reduce_value(loss).item()
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            sys.exit(1)
+
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
 
-        train_bar.desc = "train epoch[{}] loss:{:.3f}".format(epoch, loss)
+        if is_main_process():
+            train_bar.desc = f"train epoch[{epoch}] loss:{loss_value:.3f}"
 
-        global_step = epoch * len(train_loader) + step
-        tb_writer.add_scalar("train loss", loss.item(), global_step=global_step)
-        tb_writer.add_scalar("learning rate", optimizer.param_groups[0]["lr"], global_step=global_step)
+            global_step = epoch * len(train_loader) + step
+            tb_writer.add_scalar("train loss", loss.item(), global_step=global_step)
+            tb_writer.add_scalar("learning rate", optimizer.param_groups[0]["lr"], global_step=global_step)
 
 
 @torch.inference_mode()
@@ -54,8 +65,11 @@ def evaluate(model: torch.nn.Module,
              num_keypoints: int,
              img_hw: List[int]) -> None:
     model.eval()
-    metric = NMEMetric()
-    eval_bar = tqdm(val_loader, file=sys.stdout, desc="evaluation")
+    metric = NMEMetric(device=device)
+    eval_bar = val_loader
+    if is_main_process():
+        eval_bar = tqdm(val_loader, file=sys.stdout, desc="evaluation")
+
     for step, (imgs, targets) in enumerate(eval_bar):
         imgs = imgs.to(device)
         m_invs = targets["m_invs"].to(device)
@@ -69,6 +83,8 @@ def evaluate(model: torch.nn.Module,
 
         metric.update(pred, labels)
 
-    nme = metric.evaluate()
-    tb_writer.add_scalar("evaluation nme", nme, global_step=epoch)
-    print(f"evaluation NME[{epoch}]: {nme:.3f}")
+    metric.synchronize_results()
+    if is_main_process():
+        nme = metric.evaluate()
+        tb_writer.add_scalar("evaluation nme", nme, global_step=epoch)
+        print(f"evaluation NME[{epoch}]: {nme:.3f}")
